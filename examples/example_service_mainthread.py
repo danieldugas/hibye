@@ -3,7 +3,7 @@ import time
 from hibye import ServiceServer
 
 if __name__ == "__main__":
-    service_server = ServiceServer(run_in_main_thread=True)
+    service_server = ServiceServer(run_in_main_thread=True, verbose=True)
     def callback(request):
         if request == "ping":
             response = "pong"
