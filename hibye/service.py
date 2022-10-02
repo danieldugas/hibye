@@ -1,7 +1,7 @@
 # TODO: longer requests / responses
 # TODO: list available services
 # TODO: wait for service to be available
-# TODO: several hosts with named addresses? 
+# TODO: several hosts with named addresses?
 import socket
 import select
 import json
@@ -24,9 +24,11 @@ class ServiceRequest(object):
         self.data = data
 
     def from_string(string):
+        if len(string) == 0:
+            raise ValueError("received empty string when expecting a service request")
         dic = json.loads(string)
         return ServiceRequest(dic["what"], dic["channel"], dic["data"])
-    
+
     def from_bytes(data_list):
         json_string = "".join([data.decode("utf-8") for data in data_list])
         return ServiceRequest.from_string(json_string)
@@ -36,7 +38,7 @@ class ServiceRequest(object):
         return json.dumps(dic)
 
     def to_bytes(self):
-        return self.to_string().encode("utf-8") 
+        return self.to_string().encode("utf-8")
 
 class ServiceResponse(object):
     def __init__(self, status, channel, data):
@@ -47,7 +49,7 @@ class ServiceResponse(object):
     def from_string(string):
         dic = json.loads(string)
         return ServiceResponse(dic["status"], dic["channel"], dic["data"])
-    
+
     def from_bytes(data_list):
         json_string = "".join([data.decode("utf-8") for data in data_list])
         return ServiceResponse.from_string(json_string)
@@ -105,7 +107,7 @@ def get_advertised_services(master=DefaultHost()):
         raise ValueError("unknown status {}".format(service_response.status))
 
 
-def call_service(channel, request, master=DefaultHost(), s=None):  
+def call_service(channel, request, master=DefaultHost(), s=None):
     TCP_IP = master.ip
     TCP_PORT = master.port
 
@@ -131,14 +133,20 @@ def call_service(channel, request, master=DefaultHost(), s=None):
         return service_response.data
     elif service_response.status == "exception":
         print("In ServiceServer callback: ", service_response.data)
+    elif service_response.status == "unknownchannel":
+        raise ValueError("attempted to call service but server responsed 'unknown channel' {}".format(service_response.data))
     else:
         raise ValueError("unknown status {}".format(service_response.status))
+    return None
 
 class ServiceServer(Thread):
     def __init__(self, master=DefaultHost(), run_in_main_thread=False, verbose=False):
         Thread.__init__(self)
-        self.channels = {}
         self.verbose = verbose
+        # variables
+        self.channels = {}
+        self.read_sockets = None
+        # init
         self.find_or_become_master(master)
         if run_in_main_thread:
             print("ServiceServer: run_in_main_thread set to true. Please call .run() method from main thread to start listening.")
@@ -154,8 +162,10 @@ class ServiceServer(Thread):
             self.server_socket.bind((TCP_IP, TCP_PORT))
             self.is_master = True
             self.master = master
+            if self.verbose:
+                print("Bound as master at {} : {}".format(TCP_IP, TCP_PORT))
         except OSError:
-            raise NotImplementedError
+            raise NotImplementedError("Error when attempting to become master server. slave mode not yet implemented")
             advertised_services = get_advertised_services(master=master)
             if advertised_services is None:
                 raise ValueError("ServiceServer: could not find or become master")
@@ -173,52 +183,63 @@ class ServiceServer(Thread):
         self.channels[name] = callback
 
     def run(self):
+        loop_period = 0.01
+        while True:
+            self.run_once()
+            time.sleep(loop_period)
+
+    def run_once(self):
         TCP_IP = self.get_own_address().ip
         TCP_PORT = self.get_own_address().port
         BUFFER_SIZE = 1024  # Normally 1024
 
-        # server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # server_socket.bind((TCP_IP, TCP_PORT))
-        self.server_socket.listen(10)
+        if self.read_sockets is None:
+            # server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # server_socket.bind((TCP_IP, TCP_PORT))
+            self.server_socket.listen(10)
 
-        if self.verbose:
-            print("Listening on "+TCP_IP+":"+str(TCP_PORT))
-        read_sockets, write_sockets, error_sockets = select.select([self.server_socket], [], [])
-
-        while True:
             if self.verbose:
+                print("Listening on "+TCP_IP+":"+str(TCP_PORT))
+            self.read_sockets, write_sockets, error_sockets = select.select([self.server_socket], [], [])
+
+            if self.verbose:
+                print("selected sockets:")
+                print(self.read_sockets)
                 print("Waiting for incoming connections...")
-            for sock in read_sockets:
-                if self.verbose:
-                    print("Receiving connection")
-                (conn, (ip,port)) = self.server_socket.accept()
-                if self.verbose:
-                    print("Accepted connection from "+ip+":"+str(port))
-                data_list = []
-                while True:
-                    data = conn.recv(BUFFER_SIZE)
-                    if not data:
-                        break
-                    data_list.append(data)
-                    if len(data_list) == 0:
-                        if self.verbose:
-                            print("ignoring empty message")
-                        continue
-                    request = ServiceRequest.from_bytes(data_list)
+
+        for sock in self.read_sockets:
+            if self.verbose:
+                print("Receiving connection")
+            (conn, (ip,port)) = self.server_socket.accept()
+            if self.verbose:
+                print("Accepted connection from "+ip+":"+str(port))
+            data_list = []
+            while True:
+                data = conn.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                data_list.append(data)
+                if len(data_list) == 0:
                     if self.verbose:
-                        print("received request:", request.to_string())
-                    if request.what == "call_service":
-                        if request.channel in self.channels:
-                            callback = self.channels[request.channel]
-                            try:
-                                response_data = callback(request.data)
-                            except Exception as e:
-                                response = ServiceResponse("exception", request.channel, e.__repr__())
-                            else:
-                                response = ServiceResponse("success", request.channel, response_data)
+                        print("ignoring empty message")
+                    continue
+                request = ServiceRequest.from_bytes(data_list)
+                if self.verbose:
+                    print("received request:", request.to_string())
+                if request.what == "call_service":
+                    if request.channel in self.channels:
+                        channel_callback = self.channels[request.channel]
+                        try:
+                            response_data = channel_callback(request.data)
+                        except Exception as e:
+                            response = ServiceResponse("exception", request.channel, e.__repr__())
+                        else:
+                            response = ServiceResponse("success", request.channel, response_data)
                     else:
-                        raise NotImplementedError
-                    if self.verbose:
-                        print("sending response:", response.to_string())
-                    conn.send(response.to_bytes())
+                        response = ServiceResponse("unknownchannel", request.channel, request.channel)
+                else:
+                    raise NotImplementedError
+                if self.verbose:
+                    print("sending response:", response.to_string())
+                conn.send(response.to_bytes())
